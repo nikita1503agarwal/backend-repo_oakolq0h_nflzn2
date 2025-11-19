@@ -93,6 +93,7 @@ def list_collection(
             {"email": {"$regex": search, "$options": "i"}},
             {"subject": {"$regex": search, "$options": "i"}},
             {"company": {"$regex": search, "$options": "i"}},
+            {"location": {"$regex": search, "$options": "i"}},
         ]
     cursor = db[collection].find(filt).skip(skip).limit(limit).sort("updated_at", -1)
     return [_to_dict(doc) for doc in cursor]
@@ -114,6 +115,30 @@ def create_customer(payload: Customer):
     new_id = create_document("customer", payload)
     doc = db["customer"].find_one({"_id": ObjectId(new_id)})
     return _to_dict(doc)
+
+
+class CustomersBulkPayload(BaseModel):
+    customers: List[Customer]
+
+
+@app.post("/api/customers/bulk", status_code=201)
+def create_customers_bulk(payload: CustomersBulkPayload):
+    _ensure_db()
+    # insert many with timestamps, similar to create_document
+    docs = []
+    from datetime import datetime, timezone
+    for c in payload.customers:
+        d = c.model_dump()
+        d['created_at'] = datetime.now(timezone.utc)
+        d['updated_at'] = datetime.now(timezone.utc)
+        docs.append(d)
+    result = db["customer"].insert_many(docs) if docs else None
+    inserted = []
+    if result and result.inserted_ids:
+        for oid in result.inserted_ids:
+            doc = db["customer"].find_one({"_id": oid})
+            inserted.append(_to_dict(doc))
+    return {"inserted_count": len(inserted), "items": inserted}
 
 
 # Leads

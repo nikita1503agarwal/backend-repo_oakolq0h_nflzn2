@@ -24,6 +24,10 @@ class Customer(BaseModel):
     phone: Optional[str] = None
     stage: Literal["prospect", "active", "churn_risk", "inactive"] = "prospect"
     assigned_to: Optional[str] = Field(None, description="Owner user id or email")
+    # Location fields
+    location: Optional[str] = Field(None, description="City/State/Country or general location text")
+    latitude: Optional[float] = Field(None, description="Latitude for mapping")
+    longitude: Optional[float] = Field(None, description="Longitude for mapping")
 
 class Lead(BaseModel):
     name: str
