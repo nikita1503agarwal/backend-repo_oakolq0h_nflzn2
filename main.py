@@ -1,9 +1,12 @@
 import os
 from typing import List, Optional, Any, Dict
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Header
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, EmailStr
 from bson import ObjectId
+import hashlib
+import secrets
+from datetime import datetime, timedelta, timezone
 
 from database import db, create_document, get_documents
 from schemas import Customer, Lead, Activity, Ticket, User
@@ -37,6 +40,51 @@ def _to_dict(doc: Dict[str, Any]) -> Dict[str, Any]:
     if isinstance(_id, ObjectId):
         d["id"] = str(_id)
     return d
+
+
+# Simple password hashing utilities (demo-grade)
+_DEF_HASH_ITER = 100_000
+
+
+def _hash_password(password: str, salt: str) -> str:
+    data = (salt + password).encode("utf-8")
+    # PBKDF2-HMAC with sha256 for better demo security without extra deps
+    return hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt.encode("utf-8"), _DEF_HASH_ITER).hex()
+
+
+def _create_session(user_id: ObjectId) -> str:
+    _ensure_db()
+    token = secrets.token_urlsafe(32)
+    session = {
+        "user_id": user_id,
+        "token": token,
+        "created_at": datetime.now(timezone.utc),
+        "expires_at": datetime.now(timezone.utc) + timedelta(days=7),
+    }
+    db["session"].insert_one(session)
+    return token
+
+
+def _get_user_from_token(auth_header: Optional[str]) -> Optional[Dict[str, Any]]:
+    """
+    Expect Authorization: Bearer <token>
+    """
+    if not auth_header:
+        return None
+    try:
+        scheme, token = auth_header.split(" ", 1)
+    except ValueError:
+        return None
+    if scheme.lower() != "bearer":
+        return None
+    _ensure_db()
+    sess = db["session"].find_one({"token": token})
+    if not sess:
+        return None
+    if sess.get("expires_at") and sess["expires_at"] < datetime.now(timezone.utc):
+        return None
+    user = db["user"].find_one({"_id": sess["user_id"]})
+    return user
 
 
 @app.get("/")
@@ -74,6 +122,85 @@ def test_database():
 
     return response
 
+
+# ---------------------- AUTH ----------------------
+class SignupPayload(BaseModel):
+    name: str
+    email: EmailStr
+    password: str
+
+
+class LoginPayload(BaseModel):
+    email: EmailStr
+    password: str
+
+
+class AuthUser(BaseModel):
+    id: str
+    name: str
+    email: EmailStr
+    role: str
+    is_active: bool = True
+
+
+class AuthResponse(BaseModel):
+    token: str
+    user: AuthUser
+
+
+@app.post("/api/auth/signup", response_model=AuthResponse)
+def auth_signup(payload: SignupPayload):
+    _ensure_db()
+    existing = db["user"].find_one({"email": payload.email})
+    if existing:
+        raise HTTPException(status_code=400, detail="Email already registered")
+    salt = secrets.token_hex(16)
+    pwd_hash = _hash_password(payload.password, salt)
+    user_doc = {
+        "name": payload.name,
+        "email": payload.email,
+        "role": "sales",
+        "is_active": True,
+        "password_salt": salt,
+        "password_hash": pwd_hash,
+        "created_at": datetime.now(timezone.utc),
+        "updated_at": datetime.now(timezone.utc),
+    }
+    res = db["user"].insert_one(user_doc)
+    token = _create_session(res.inserted_id)
+    user_out = AuthUser(id=str(res.inserted_id), name=user_doc["name"], email=user_doc["email"], role=user_doc["role"], is_active=True)
+    return {"token": token, "user": user_out}
+
+
+@app.post("/api/auth/login", response_model=AuthResponse)
+def auth_login(payload: LoginPayload):
+    _ensure_db()
+    user = db["user"].find_one({"email": payload.email})
+    if not user:
+        raise HTTPException(status_code=400, detail="Invalid credentials")
+    salt = user.get("password_salt")
+    if not salt:
+        raise HTTPException(status_code=400, detail="Password not set for user")
+    pwd_hash = _hash_password(payload.password, salt)
+    if pwd_hash != user.get("password_hash"):
+        raise HTTPException(status_code=400, detail="Invalid credentials")
+    if not user.get("is_active", True):
+        raise HTTPException(status_code=403, detail="User disabled")
+    token = _create_session(user["_id"])
+    user_out = AuthUser(id=str(user["_id"]), name=user["name"], email=user["email"], role=user.get("role", "sales"), is_active=user.get("is_active", True))
+    return {"token": token, "user": user_out}
+
+
+@app.get("/api/auth/me", response_model=AuthUser)
+def auth_me(authorization: Optional[str] = Header(None)):
+    _ensure_db()
+    user = _get_user_from_token(authorization)
+    if not user:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    return AuthUser(id=str(user["_id"]), name=user["name"], email=user["email"], role=user.get("role", "sales"), is_active=user.get("is_active", True))
+
+
+# -------------------- GENERIC LIST --------------------
 
 # Generic list endpoint helper
 
